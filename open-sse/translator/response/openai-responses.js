@@ -503,6 +503,73 @@ function computeFinishReason(state) {
     : OPENAI_FINISH.STOP;
 }
 
+// Terminal snapshots repeat streamed text. Only append a missing suffix, and
+// correlate by both item id and output index (compatible providers may omit one).
+function responseTextChunk(data, state, snapshot = false) {
+  const text = snapshot ? data.text : data.delta;
+  if (typeof text !== "string" || !text) return null;
+  state.respTextBuffers ??= new Map();
+  const part = data.content_index ?? 0;
+  const idKey = data.item_id ? `id:${data.item_id}:${part}` : null;
+  const indexKey = data.output_index !== undefined || !idKey ? `index:${data.output_index ?? 0}:${part}` : null;
+  state.respTextUnindexed ??= new Set();
+  // An index-only snapshot cannot safely identify an earlier item-id-only
+  // stream. Skip it rather than replaying text or guessing among parallel items.
+  if (snapshot && !idKey && !state.respTextBuffers.has(indexKey)
+    && [...state.respTextUnindexed].some((key) => key.endsWith(`:${part}`))) return null;
+  if (idKey && !indexKey) state.respTextUnindexed.add(idKey);
+  if (idKey && indexKey) state.respTextUnindexed.delete(idKey);
+  const previous = (idKey && state.respTextBuffers.get(idKey)) || (indexKey && state.respTextBuffers.get(indexKey)) || "";
+  const delta = snapshot ? (text.startsWith(previous) ? text.slice(previous.length) : "") : text;
+  if (idKey) state.respTextBuffers.set(idKey, previous + delta);
+  if (indexKey) state.respTextBuffers.set(indexKey, previous + delta);
+  return delta ? buildChunk(
+    { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+    { content: delta }
+  ) : null;
+}
+
+// Added, done and completed-only calls must all allocate through the same item
+// correlator. Output indices are aliases, not Chat tool indices (text/reasoning
+// items also occupy output slots).
+function responseToolChunk(data, state, snapshot = false) {
+  const item = data.item;
+  state.respToolChatIndex ??= new Map();
+  const keys = [item.id || data.item_id, item.call_id, data.output_index !== undefined ? `output:${data.output_index}` : null].filter(Boolean);
+  const known = keys.map((key) => state.respToolChatIndex.get(key)).find((index) => index !== undefined)
+    ?? (snapshot && !keys.length && state.toolCallIndex === 1 ? 0 : undefined);
+  // A done event with only an unrecognized output index is not evidence of a
+  // new call. Do not invent an empty-name call or attach args to another tool.
+  if (snapshot && known === undefined && state.toolCallIndex > 0
+    && !item.id && !data.item_id && !item.call_id && !item.name) return null;
+  const index = known ?? state.toolCallIndex++;
+  for (const key of keys) state.respToolChatIndex.set(key, index);
+  const call = { index, function: {} };
+  if (known === undefined) {
+    state.currentToolCallId = item.call_id || fallbackToolCallId();
+    call.id = state.currentToolCallId;
+    call.type = OPENAI_BLOCK.FUNCTION;
+    call.function = { name: item.name || "", arguments: "" };
+  }
+  if (snapshot) {
+    const fullArgs = item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL ? item.input : item.arguments;
+    state.respToolArgsBuffers ??= new Map();
+    const previous = state.respToolArgsBuffers.get(index) || "";
+    if (typeof fullArgs === "string" && fullArgs.startsWith(previous)) {
+      const missing = fullArgs.slice(previous.length);
+      if (missing) {
+        call.function.arguments = missing;
+        state.respToolArgsBuffers.set(index, fullArgs);
+      }
+    }
+  }
+  if (known !== undefined && !call.function.arguments) return null;
+  return buildChunk(
+    { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+    { tool_calls: [call] }
+  );
+}
+
 /**
  * Translate OpenAI Responses API chunk to OpenAI Chat Completions format
  * This is for when Codex returns data and we need to send it to an OpenAI-compatible client
@@ -546,24 +613,18 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     // output_item.added events before any done/delta. Lazily created so callers
     // that build their own state object (stream.js) need no changes.
     state.respToolChatIndex ??= new Map();
-    // Indices that already received argument deltas (guards done-with-args).
-    state.respToolArgsEmitted ??= new Set();
+    // Accumulated argument text lets terminal snapshots append only missing suffixes.
+    state.respToolArgsBuffers ??= new Map();
   }
 
-  // Text content delta
+  // Deltas and terminal text snapshots share per-item/part buffers so done-only
+  // providers work without replaying text already sent to the client.
   if (eventType === "response.output_text.delta") {
-    const delta = data.delta || "";
-    if (!delta) return null;
-
-    return buildChunk(
-      { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
-      { content: delta }
-    );
+    return responseTextChunk(data, state);
   }
 
-  // Text content done (ignore, we handle via delta)
   if (eventType === "response.output_text.done") {
-    return null;
+    return responseTextChunk(data, state, true);
   }
 
   // Function call started (standard function_call or custom_tool_call).
@@ -572,29 +633,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   // before dones — the client then concatenates N JSON payloads into one
   // tool input and fails validation. The server item id is the correlator.
   if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
-    const item = data.item;
-    state.currentToolCallId = item.call_id || fallbackToolCallId();
-    state.respToolChatIndex ??= new Map();
-    const key = item.id || data.item_id || state.currentToolCallId;
-    let idx;
-    if (key && state.respToolChatIndex.has(key)) {
-      idx = state.respToolChatIndex.get(key); // duplicate added (retry) — reuse
-    } else {
-      idx = state.toolCallIndex++;
-      if (key) state.respToolChatIndex.set(key, idx);
-    }
-
-    return buildChunk(
-      { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
-      {
-        tool_calls: [{
-          index: idx,
-          id: state.currentToolCallId,
-          type: OPENAI_BLOCK.FUNCTION,
-          function: { name: item.name || "", arguments: "" }
-        }]
-      }
-    );
+    return responseToolChunk(data, state);
   }
 
   // Function call arguments delta (standard or custom_tool_call variant).
@@ -603,10 +642,11 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     const argsDelta = data.delta || "";
     if (!argsDelta) return null;
 
-    const known = data.item_id ? state.respToolChatIndex?.get(data.item_id) : undefined;
+    const known = (data.item_id ? state.respToolChatIndex?.get(data.item_id) : undefined)
+      ?? (data.output_index !== undefined ? state.respToolChatIndex?.get(`output:${data.output_index}`) : undefined);
     const idx = known ?? Math.max(0, (state.toolCallIndex || 1) - 1);
-    state.respToolArgsEmitted ??= new Set();
-    state.respToolArgsEmitted.add(idx);
+    state.respToolArgsBuffers ??= new Map();
+    state.respToolArgsBuffers.set(idx, (state.respToolArgsBuffers.get(idx) || "") + argsDelta);
     return buildChunk(
       { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
       { tool_calls: [{ index: idx, function: { arguments: argsDelta } }] }
@@ -617,20 +657,10 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   // Index was assigned at added-time; nothing to advance. Some upstreams send
   // complete arguments only here (no deltas) — emit them once in that case.
   if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
-    const key = data.item?.id || data.item_id;
-    const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
-    const fullArgs = data.item?.arguments;
-    if (typeof fullArgs === "string" && fullArgs) {
-      state.respToolArgsEmitted ??= new Set();
-      if (!state.respToolArgsEmitted.has(idx)) {
-        state.respToolArgsEmitted.add(idx);
-        return buildChunk(
-          { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
-          { tool_calls: [{ index: idx, function: { arguments: fullArgs } }] }
-        );
-      }
-    }
-    return null;
+    // Some legacy done events contain only a type and no correlator or payload.
+    if (!data.item.id && !data.item_id && !data.item.call_id && data.output_index === undefined
+      && data.item.arguments === undefined && data.item.input === undefined) return null;
+    return responseToolChunk(data, state, true);
   }
 
   // Response completed
@@ -648,6 +678,22 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     }
     
     if (!state.finishReasonSent) {
+      const snapshots = [];
+      const output = Array.isArray(data.response?.output) ? data.response.output : [];
+      for (const [outputIndex, item] of output.entries()) {
+        if (!item || typeof item !== "object") continue;
+        if (item.type === RESPONSES_ITEM.FUNCTION_CALL || item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) {
+          const toolChunk = responseToolChunk({ item, output_index: outputIndex }, state, true);
+          if (toolChunk) snapshots.push(toolChunk);
+          continue;
+        }
+        if (item.type !== RESPONSES_ITEM.MESSAGE || !Array.isArray(item.content)) continue;
+        for (const [contentIndex, part] of item.content.entries()) {
+          if (part?.type !== RESPONSES_ITEM.OUTPUT_TEXT) continue;
+          const textChunk = responseTextChunk({ item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text }, state, true);
+          if (textChunk) snapshots.push(textChunk);
+        }
+      }
       const finishReason = computeFinishReason(state);
 
       state.finishReasonSent = true;
@@ -664,7 +710,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
         finalChunk.usage = state.usage;
       }
       
-      return finalChunk;
+      return snapshots.length ? [...snapshots, finalChunk] : finalChunk;
     }
     return null;
   }

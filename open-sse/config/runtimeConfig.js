@@ -55,6 +55,10 @@ export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 10
 // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
 export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 
+// Downstream keepalive for validated Claude SSE responses. Never extends the raw upstream watchdog.
+export const STREAM_HEARTBEAT_INTERVAL_MS = 15 * 1000;
+export const CLAUDE_STREAM_PING = 'event: ping\ndata: {"type":"ping"}\n\n';
+
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
 

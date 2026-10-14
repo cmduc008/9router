@@ -22,6 +22,14 @@ function processSSEMessage(msg, state) {
   try { parsed = JSON.parse(dataStr); }
   catch { return; }
 
+  if (state.error) return;
+  if (eventType === "error" || eventType === "response.failed" || eventType === "response.incomplete" ||
+      parsed.response?.status === "failed" || parsed.response?.status === "incomplete") {
+    state.status = "failed";
+    state.error = { message: "Upstream Responses stream failed or was incomplete" };
+    return;
+  }
+
   if (eventType === "response.created") {
     state.responseId = parsed.response?.id || state.responseId;
     state.created = parsed.response?.created_at || state.created;
@@ -29,6 +37,11 @@ function processSSEMessage(msg, state) {
     state.items.set(parsed.output_index ?? 0, parsed.item);
   } else if (eventType === "response.completed" || eventType === "response.done") {
     state.status = "completed";
+    state.responseId = parsed.response?.id || state.responseId;
+    state.created = parsed.response?.created_at || state.created;
+    if (Array.isArray(parsed.response?.output)) {
+      parsed.response.output.forEach((item, index) => state.items.set(index, item));
+    }
     if (parsed.response?.usage) {
       state.usage.input_tokens = parsed.response.usage.input_tokens || 0;
       state.usage.output_tokens = parsed.response.usage.output_tokens || 0;
@@ -69,7 +82,7 @@ export async function convertResponsesStreamToJson(stream) {
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const messages = buffer.split("\n\n");
+      const messages = buffer.split(/\r?\n\r?\n/);
       buffer = messages.pop() || "";
 
       for (const msg of messages) {
@@ -78,6 +91,7 @@ export async function convertResponsesStreamToJson(stream) {
     }
 
     // Flush remaining buffer (last event may not end with \n\n)
+    buffer += decoder.decode();
     if (buffer.trim()) {
       processSSEMessage(buffer, state);
     }

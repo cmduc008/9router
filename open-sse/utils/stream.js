@@ -2,7 +2,7 @@ import { translateResponse, initState } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
+import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes } from "./streamHelpers.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
@@ -89,6 +89,26 @@ export function createSSEStream(options = {}) {
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
   let completionFlushTimer = null;
+  const isResponsesToClaude = mode === STREAM_MODE.TRANSLATE &&
+    targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.CLAUDE;
+  let responsesFailed = false;
+  let responsesCompleted = false;
+
+  // Responses failures must not become assistant text or a synthetic end_turn.
+  const validateResponsesEvent = (parsed, controller) => {
+    if (!isResponsesToClaude) return true;
+    if (responsesFailed) return false;
+    const event = getOpenAIResponsesEventName(currentOpenAIResponsesEvent, parsed);
+    const status = parsed.response?.status;
+    if (event === "error" || event === "response.failed" || event === "response.incomplete" ||
+        status === "failed" || status === "incomplete") {
+      responsesFailed = true;
+      controller.enqueue(buildStreamErrorBytes(502, "Upstream Responses stream failed or was incomplete", sourceFormat));
+      return false;
+    }
+    if (event === "response.completed" || event === "response.done") responsesCompleted = true;
+    return true;
+  };
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
   // closes right after the terminal event cancels the reader, and flush() never runs.
@@ -96,6 +116,7 @@ export function createSSEStream(options = {}) {
     if (completionFlushTimer) { clearTimeout(completionFlushTimer); completionFlushTimer = null; }
     if (finalized) return;
     finalized = true;
+    if (responsesFailed) return;
 
     const isPassthrough = mode === STREAM_MODE.PASSTHROUGH;
     let finalUsage = isPassthrough ? usage : state?.usage;
@@ -272,6 +293,7 @@ export function createSSEStream(options = {}) {
 
         const parsed = parseSSELine(trimmed, targetFormat);
         if (!parsed) continue;
+        if (!validateResponsesEvent(parsed, controller)) continue;
 
         // Responses API same-format passthrough: preserve event framing + track terminal state
         const isOpenAIResponsesStream = targetFormat === FORMATS.OPENAI_RESPONSES;
@@ -465,7 +487,7 @@ export function createSSEStream(options = {}) {
           // but it is the real final chunk — it holds finish_reason and the token
           // counts — so it has to go through.
           const isDoneSentinel = parsed?.done && targetFormat !== FORMATS.OLLAMA;
-          if (parsed && !isDoneSentinel) {
+          if (parsed && !isDoneSentinel && validateResponsesEvent(parsed, controller)) {
             // Same accumulation the transform loop does, so finalizeStream() can
             // log a tail chunk's tokens instead of falling back to null.
             const extracted = extractUsage(parsed);
@@ -489,6 +511,15 @@ export function createSSEStream(options = {}) {
               }
             }
           }
+        }
+
+        if (isResponsesToClaude && !responsesCompleted && !responsesFailed) {
+          responsesFailed = true;
+          controller.enqueue(buildStreamErrorBytes(502, "Upstream Responses stream ended before completion", sourceFormat));
+        }
+        if (responsesFailed) {
+          finalizeStream();
+          return;
         }
 
         const flushed = translateResponse(targetFormat, sourceFormat, null, state);

@@ -99,10 +99,16 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
  * @param {function} [onAbortTerminal] - Receives a human-readable abort
  * message and returns terminal SSE bytes to emit downstream.
  */
-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null) {
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, heartbeat = null) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
+  let ended = false;
+  let heartbeatTimer = null;
+  let resumePump = null;
+  let lastOutputAt = Date.now();
+  let frameTail = "";
+  let atFrameBoundary = true;
 
   // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
   const emitTerminal = (controller) => {
@@ -114,64 +120,100 @@ export function createDisconnectAwareStream(transformStream, streamController, o
     } catch { /* best-effort terminal */ }
   };
 
+  let onSignalAbort;
+  const cleanup = () => {
+    ended = true;
+    if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+    streamController.signal?.removeEventListener("abort", onSignalAbort);
+    resumePump?.();
+    resumePump = null;
+  };
+  const cancelTransform = (reason) => Promise.allSettled([
+    reader.cancel(reason), writer.abort(reason)
+  ]);
+
   return new ReadableStream({
-    async pull(controller) {
-      if (!streamController.isConnected()) {
-        emitTerminal(controller);
-        controller.close();
-        return;
-      }
-
-      try {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          streamController.handleComplete();
+    start(controller) {
+      const fail = (error) => {
+        if (ended) return;
+        cleanup();
+        streamController.handleError(error);
+        cancelTransform(error).catch(() => {});
+        // HTTP headers are already sent: preserve failure in-band when possible.
+        if (onAbortTerminal) {
+          emitTerminal(controller);
           controller.close();
-          return;
+        } else {
+          // Preserve the helper's legacy no-terminal network-close behavior.
+          // Chat streaming always provides a structured error encoder.
+          const msg = error?.message || "";
+          const code = error?.code || error?.cause?.code || "";
+          const isNetworkClose = error?.name === "AbortError" ||
+            /aborted|socket hang up|ECONNRESET|ETIMEDOUT|EPIPE/.test(msg) ||
+            ["ECONNRESET", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET"].includes(code);
+          if (isNetworkClose) controller.close();
+          else controller.error(error);
         }
-        controller.enqueue(value);
-      } catch (error) {
-        const wasConnected = streamController.isConnected();
-        // Controller already closed = downstream ended; not an upstream error, skip noisy log.
-        const msg0 = error?.message || "";
-        const isControllerClosed = msg0.includes("already closed") || msg0.includes("Invalid state");
-        if (!isControllerClosed) streamController.handleError(error);
-        reader.cancel().catch(() => {});
-        writer.abort().catch(() => {});
+      };
+      onSignalAbort = () => fail(new Error("upstream connection lost"));
+      streamController.signal?.addEventListener("abort", onSignalAbort, { once: true });
+      if (streamController.signal?.aborted) { onSignalAbort(); return; }
 
-        // Treat network resets / socket hang up / abort as graceful close
-        const msg = error?.message || "";
-        const code = error?.code || error?.cause?.code || "";
-        const isNetworkClose =
-          error.name === "AbortError" ||
-          msg.includes("aborted") ||
-          msg.includes("socket hang up") ||
-          msg.includes("ECONNRESET") ||
-          msg.includes("ETIMEDOUT") ||
-          msg.includes("EPIPE") ||
-          code === "ECONNRESET" ||
-          code === "ETIMEDOUT" ||
-          code === "EPIPE" ||
-          code === "UND_ERR_SOCKET";
-
-        // Graceful close on network/abort, or when a structured terminal is available
-        // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
-        try {
-          if (!wasConnected || isNetworkClose || onAbortTerminal) {
-            emitTerminal(controller);
-            controller.close();
-          } else {
-            controller.error(error);
+      if (heartbeat?.intervalMs > 0 && heartbeat.bytes) {
+        heartbeatTimer = setInterval(() => {
+          // Never splice a ping into a partially emitted SSE frame or accumulate
+          // pings behind a slow client. These bytes do not touch the raw watchdog.
+          if (!ended && streamController.isConnected() && atFrameBoundary &&
+              controller.desiredSize > 0 && Date.now() - lastOutputAt >= heartbeat.intervalMs) {
+            controller.enqueue(heartbeat.bytes);
+            lastOutputAt = Date.now();
           }
-        } catch (e) { /* already closed or cancelled */ }
+        }, heartbeat.intervalMs);
       }
+
+      // Independent reader pump: an awaited reader.read() in pull would keep
+      // pull pending and prevent a heartbeat from triggering the next client read.
+      (async () => {
+        try {
+          while (!ended) {
+            if (controller.desiredSize <= 0) {
+              await new Promise(resolve => { resumePump = resolve; });
+              if (ended) break;
+            }
+            const { done, value } = await reader.read();
+            if (ended) break;
+            if (done) {
+              cleanup();
+              streamController.handleComplete();
+              controller.close();
+              break;
+            }
+            controller.enqueue(value);
+            lastOutputAt = Date.now();
+            if (heartbeat) {
+              frameTail = (frameTail + new TextDecoder().decode(value)).slice(-4);
+              atFrameBoundary = frameTail.endsWith("\n\n") || frameTail.endsWith("\r\n\r\n");
+            }
+          }
+        } catch (error) {
+          fail(error);
+        } finally {
+          reader.releaseLock();
+          writer.releaseLock?.();
+        }
+      })();
+    },
+
+    pull() {
+      resumePump?.();
+      resumePump = null;
     },
 
     cancel(reason) {
+      cleanup();
       streamController.handleDisconnect(reason || "cancelled");
-      reader.cancel();
-      writer.abort();
+      return cancelTransform(reason);
     }
   });
 }
@@ -192,7 +234,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, heartbeat = null) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
@@ -254,7 +296,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   return createDisconnectAwareStream(
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
-    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null
+    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null,
+    heartbeat
   );
 }
 
